@@ -133,9 +133,17 @@ function handleServiceWorkerMessage(serviceWorkerMessage: Message) {
     case MessageTypes.SW2CS_REMOTE_UPDATE:
       handleRemoteUpdate(serviceWorkerMessage);
       break;
+    case MessageTypes.SW2CS_CONNECTION_ERROR:
+      log("Connection error received:", serviceWorkerMessage.error);
+      if (g_heartBeatInterval) {
+        clearInterval(g_heartBeatInterval);
+        g_heartBeatInterval = undefined;
+      }
+      break;
     case MessageTypes.SW2CS_ROOM_DISCONNECT:
       if (g_heartBeatInterval) {
         clearInterval(g_heartBeatInterval);
+        g_heartBeatInterval = undefined;
       }
       break;
     default:

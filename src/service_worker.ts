@@ -7,8 +7,19 @@ import { Message, MessageTypes, PortName, States, TabInfo } from "./types";
 declare const process: { env: { [key: string]: string | undefined } };
 declare const self: ServiceWorkerGlobalScope;
 
-const tabsInfo: { [index: number]: TabInfo | undefined } = {};
+interface ExtendedTabInfo extends TabInfo {
+  reconnectTimer?: NodeJS.Timeout;
+  heartbeatInterval?: NodeJS.Timeout;
+  lastHeartbeat?: Date;
+}
+
+const tabsInfo: { [index: number]: ExtendedTabInfo | undefined } = {};
 const serverUrl = process.env.SYNC_SERVER!;
+
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAY_BASE = 1000;
+const HEARTBEAT_INTERVAL = 30000;
+const CONNECTION_TIMEOUT = 10000;
 
 let popupPort: chrome.runtime.Port | undefined = undefined;
 
@@ -17,7 +28,13 @@ function handleContentScriptConnection(port: chrome.runtime.Port): void {
   const url = port.sender?.tab?.url!;
 
   if (_.isNil(tabsInfo[tabId])) {
-    tabsInfo[tabId] = { port, tabId, sentConnectionRequest: false };
+    tabsInfo[tabId] = { 
+      port, 
+      tabId, 
+      sentConnectionRequest: false,
+      reconnectAttempts: 0,
+      connectionState: 'disconnected'
+    };
   }
 
   const urlRoomId: string | null = getParameterByName(url, "rollTogetherRoom");
@@ -43,6 +60,37 @@ function tryUpdatePopup(roomId: string | undefined = undefined): void {
   });
 }
 
+function clearReconnectTimer(tabId: number): void {
+  const tabInfo = tabsInfo[tabId];
+  if (tabInfo?.reconnectTimer) {
+    clearTimeout(tabInfo.reconnectTimer);
+    delete tabInfo.reconnectTimer;
+  }
+}
+
+function clearHeartbeatInterval(tabId: number): void {
+  const tabInfo = tabsInfo[tabId];
+  if (tabInfo?.heartbeatInterval) {
+    clearInterval(tabInfo.heartbeatInterval);
+    delete tabInfo.heartbeatInterval;
+  }
+}
+
+function startHeartbeat(tabId: number): void {
+  const tabInfo = tabsInfo[tabId];
+  if (!tabInfo?.socket) return;
+
+  clearHeartbeatInterval(tabId);
+  
+  tabInfo.heartbeatInterval = setInterval(() => {
+    if (tabInfo.socket?.connected) {
+      tabInfo.socket.emit('heartbeat');
+      tabInfo.lastHeartbeat = new Date();
+      log(`Heartbeat sent for tab ${tabId}`);
+    }
+  }, HEARTBEAT_INTERVAL);
+}
+
 function disconnectWebsocket(tabId: number): void {
   log("Disconnecting websocket", tabId);
   const tabInfo = tabsInfo[tabId];
@@ -51,8 +99,12 @@ function disconnectWebsocket(tabId: number): void {
     return;
   }
 
-  const { socket, roomId }: TabInfo = tabInfo;
+  clearReconnectTimer(tabId);
+  clearHeartbeatInterval(tabId);
+
+  const { socket, roomId } = tabInfo;
   if (socket) {
+    socket.removeAllListeners();
     socket.disconnect();
     delete tabInfo.socket;
   }
@@ -60,7 +112,42 @@ function disconnectWebsocket(tabId: number): void {
     delete tabInfo.roomId;
   }
 
+  tabInfo.connectionState = 'disconnected';
+  tabInfo.reconnectAttempts = 0;
   tryUpdatePopup();
+}
+
+function sendConnectionErrorToContentScript(tabId: number, error: string): void {
+  log("Sending connection error to contentScript", { tabId, error });
+
+  const message: Message = {
+    type: MessageTypes.SW2CS_CONNECTION_ERROR,
+    error,
+  };
+  tabsInfo[tabId]?.port.postMessage(message);
+}
+
+function scheduleReconnect(tabId: number, urlRoomId: string | null, videoProgress: number, videoState: States): void {
+  const tabInfo = tabsInfo[tabId];
+  if (!tabInfo) return;
+
+  tabInfo.reconnectAttempts = (tabInfo.reconnectAttempts || 0) + 1;
+
+  if (tabInfo.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+    log(`Max reconnection attempts reached for tab ${tabId}`);
+    tabInfo.connectionState = 'disconnected';
+    sendConnectionErrorToContentScript(tabId, `Failed to connect after ${MAX_RECONNECT_ATTEMPTS} attempts`);
+    return;
+  }
+
+  const delay = RECONNECT_DELAY_BASE * Math.pow(2, tabInfo.reconnectAttempts - 1);
+  log(`Scheduling reconnection attempt ${tabInfo.reconnectAttempts} for tab ${tabId} in ${delay}ms`);
+
+  tabInfo.connectionState = 'reconnecting';
+  tabInfo.reconnectTimer = setTimeout(() => {
+    log(`Attempting reconnection ${tabInfo.reconnectAttempts} for tab ${tabId}`);
+    connectWebsocket(tabId, videoProgress, videoState, urlRoomId, true);
+  }, delay);
 }
 
 function handlePopupMessage(message: Message, port: chrome.runtime.Port): void {
@@ -99,11 +186,13 @@ function handleContentScriptMessage(
       );
       break;
     case MessageTypes.CS2SW_LOCAL_UPDATE:
-      tabsInfo[tabId]?.socket?.emit(
-        "update",
-        message.state,
-        message.currentProgress
-      );
+      const tabInfo = tabsInfo[tabId];
+      if (tabInfo?.socket?.connected) {
+        tabInfo.socket.emit("update", message.state, message.currentProgress);
+      } else {
+        log(`Socket not connected for tab ${tabId}, attempting to reconnect`);
+        connectWebsocket(tabId, message.currentProgress, message.state, tabInfo?.roomId || null);
+      }
       break;
     default:
       throw "Invalid ContentScriptMessageType " + message.type;
@@ -136,7 +225,7 @@ function sendConnectionRequestToContentScript(tabId: number): void {
     return;
   }
 
-  if (tabInfo.sentConnectionRequest) {
+  if (tabInfo.sentConnectionRequest && tabInfo.connectionState === 'connecting') {
     log("Connection request already sent to contentScript", { tab });
     return;
   }
@@ -161,13 +250,15 @@ function connectWebsocket(
   tabId: number,
   videoProgress: number,
   videoState: States,
-  urlRoomId: string | null
+  urlRoomId: string | null,
+  isReconnect: boolean = false
 ) {
   log("Connecting websocket", {
     tabId,
     videoProgress,
     videoState,
     urlRoomId,
+    isReconnect,
   });
   const tabInfo = tabsInfo[tabId];
   if (!tabInfo) {
@@ -175,26 +266,86 @@ function connectWebsocket(
     return;
   }
 
-  if (tabInfo.socket) {
-    log(
-      `Socket is already configured for tab ${tabId}. Disconnect existing connection before attempting to connect.`
-    );
+  if (tabInfo.socket?.connected && !isReconnect) {
+    log(`Socket is already connected for tab ${tabId}`);
     return;
   }
+
+  if (tabInfo.connectionState === 'connecting') {
+    log(`Connection already in progress for tab ${tabId}`);
+    return;
+  }
+
+  tabInfo.connectionState = 'connecting';
+  clearReconnectTimer(tabId);
 
   let query: string = `videoProgress=${Math.round(
     videoProgress
   )}&videoState=${videoState}${urlRoomId ? `&room=${urlRoomId}` : ""}`;
 
-  tabInfo.socket = io(serverUrl, { query, transports: ["websocket"] });
-  tabInfo.socket.on(
+  const socketOptions = {
+    query,
+    transports: ["websocket", "polling"],
+    timeout: CONNECTION_TIMEOUT,
+    reconnection: false,
+    forceNew: true,
+  };
+
+  tabInfo.socket = io(serverUrl, socketOptions);
+
+  const socket = tabInfo.socket;
+
+  const connectionTimeout = setTimeout(() => {
+    if (tabInfo.connectionState === 'connecting') {
+      log(`Connection timeout for tab ${tabId}`);
+      socket.disconnect();
+      scheduleReconnect(tabId, urlRoomId, videoProgress, videoState);
+    }
+  }, CONNECTION_TIMEOUT);
+
+  socket.on('connect', () => {
+    clearTimeout(connectionTimeout);
+    log(`Socket connected for tab ${tabId}`);
+    tabInfo.connectionState = 'connected';
+    tabInfo.reconnectAttempts = 0;
+    startHeartbeat(tabId);
+  });
+
+  socket.on('connect_error', (error: Error) => {
+    clearTimeout(connectionTimeout);
+    log(`Connection error for tab ${tabId}:`, error);
+    tabInfo.connectionState = 'disconnected';
+    scheduleReconnect(tabId, urlRoomId, videoProgress, videoState);
+  });
+
+  socket.on('disconnect', (reason: string) => {
+    clearTimeout(connectionTimeout);
+    clearHeartbeatInterval(tabId);
+    log(`Socket disconnected for tab ${tabId}. Reason: ${reason}`);
+    
+    tabInfo.connectionState = 'disconnected';
+    
+    if (reason === 'io server disconnect' || reason === 'io client disconnect') {
+      log(`Manual disconnect for tab ${tabId}, not attempting to reconnect`);
+      return;
+    }
+    
+    scheduleReconnect(tabId, urlRoomId, videoProgress, videoState);
+  });
+
+  socket.on('error', (error: Error) => {
+    log(`Socket error for tab ${tabId}:`, error);
+  });
+
+  socket.on(
     "join",
     (receivedRoomId: string, roomState: States, roomProgress: number): void => {
       tabInfo.roomId = receivedRoomId;
-      log("Sucessfully joined a room", {
+      log("Successfully joined a room", {
         roomId: tabInfo.roomId,
         roomState,
         roomProgress,
+        isReconnect,
       });
       tryUpdatePopup(tabInfo.roomId);
       chrome.action.enable(tabId);
@@ -204,10 +355,18 @@ function connectWebsocket(
     }
   );
 
-  tabInfo.socket.on(
+  socket.on(
     "update",
     (id: string, roomState: States, roomProgress: number): void => {
       log("Received update Message from ", id, { roomState, roomProgress });
+      sendUpdateToContentScript(tabId, roomState, roomProgress);
+    }
+  );
+
+  socket.on(
+    "reconnected",
+    (roomId: string, roomState: States, roomProgress: number): void => {
+      log("Received reconnected event", { roomId, roomState, roomProgress });
       sendUpdateToContentScript(tabId, roomState, roomProgress);
     }
   );

@@ -31,6 +31,7 @@ export enum MessageTypes {
   SW2CS_REMOTE_UPDATE = "sw2cs_remote_update",
   SW2CS_ROOM_CONNECTION = "sw2cs_room_connection",
   SW2CS_ROOM_DISCONNECT = "sw2cs_room_disconnect",
+  SW2CS_CONNECTION_ERROR = "sw2cs_connection_error",
   SW2PU_SEND_ROOM_ID = "sw2pu_update_ux",
   SW2PU_ROOM_ID = "sw2pu_room_id",
   PU2SW_REQUEST_ROOM_ID = "pu2sw_get_room_id",
@@ -59,6 +60,7 @@ export type Message =
       roomProgress: number;
     }
   | { type: MessageTypes.SW2CS_ROOM_CONNECTION }
+  | { type: MessageTypes.SW2CS_CONNECTION_ERROR; error: string }
   | { type: MessageTypes.SW2PU_SEND_ROOM_ID; roomId: string }
   | { type: MessageTypes.SW2PU_ROOM_ID; roomId: string }
   | { type: MessageTypes.PU2SW_CREATE_ROOM; tabId: number }
@@ -88,6 +90,8 @@ export interface TabInfo {
   socket?: SocketIOClient.Socket;
   roomId?: string;
   sentConnectionRequest: boolean;
+  reconnectAttempts?: number;
+  connectionState?: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 }
 
 export interface Radius {
