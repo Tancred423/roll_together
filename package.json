@@ -3,7 +3,8 @@
     "build": "webpack --env development",
     "watch": "webpack --env development -w",
     "publish": "node increment_version.js",
-    "postpublish": "webpack --env production && cd build/ && bestzip ../rolltogether.zip *"
+    "postpublish": "webpack --env production && cd build/ && bestzip ../rolltogether.zip *",
+    "build:prod": "webpack --env production"
   },
   "private": true,
   "devDependencies": {
